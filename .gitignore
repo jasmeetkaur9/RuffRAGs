@@ -1,0 +1,17 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Conversation threads
+threads/
+
+# uv
+uv.lock
+
+# Editor
+.DS_Store
