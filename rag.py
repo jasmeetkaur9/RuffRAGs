@@ -1,3 +1,12 @@
+import phoenix as px
+from phoenix.otel import register
+from openinference.instrumentation.langchain import LangChainInstrumentor
+
+px.launch_app()
+tracer_provider = register(project_name="RAGs")
+LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+tracer = tracer_provider.get_tracer("RAGs")
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.agents.middleware import dynamic_prompt, ModelRequest
@@ -26,28 +35,32 @@ class AgentState(AgentState):
 def prompt_with_context(request:ModelRequest):
 
     last_query = request.state["messages"][-1].text
-    last_message = request.state["messages"][-1]
 
-    retrieved_docs = vectorstore.similarity_search(last_query, k = 5)
+    retrieved_docs = vectorstore.similarity_search(last_query, k = 3)
     # retrieved_docs = hy_store.similarity_search(last_query, 3, 6)
-    
-    content = [] 
-    for d in retrieved_docs:
-        link_doc = d.metadata.get("link")
-        content.append(f"Content: {d.page_content}\n Link: {link_doc}")
-    
-    docs_content = "\n\n".join(content)
 
-    system_message = (
-        "You are a helpful and friendly assistant for answering user queries." 
-        "Answer exclusively from the supplied context. "
-        "Use the following pieces of retrieved context to answer the question."
-        "Stick to answers related to the company's product."
-        "If not sure of the how to answer, keep the answer general and strictly within the context."
-        "If there is no answer, suggest reaching out to the team."
-        "Answer with a positive tone and keep the answer concise. Use a maximum of five sentences."
-        f"\n\n{docs_content}"
-    )
+    with tracer.start_as_current_span("rag.retrieval") as span:
+        content = []
+        for i, d in enumerate(retrieved_docs):
+            link_doc = d.metadata.get("link")
+            content.append(f"Content: {d.page_content}\n Link: {link_doc}")
+            span.set_attribute(f"retrieval.doc_{i}.content", d.page_content)
+            span.set_attribute(f"retrieval.doc_{i}.title", d.metadata.get("title", ""))
+
+        docs_content = "\n\n".join(content)
+
+        system_message = (
+            "You are a helpful and friendly assistant for answering user queries."
+            "Answer exclusively from the supplied context. "
+            "Use the following pieces of retrieved context to answer the question."
+            "Stick to answers related to the company's product."
+            "If not sure of the how to answer, keep the answer general and strictly within the context."
+            "If there is no answer, suggest reaching out to the team."
+            "Answer with a positive tone and keep the answer concise. Use a maximum of five sentences."
+            f"\n\n{docs_content}"
+        )
+
+        span.set_attribute("prompt.injected_system", system_message)
 
     return system_message
 
@@ -69,23 +82,29 @@ def save_thread_history(thread_id, messages):
 
 def run_chat(query, session_id, get_session_hist:False):
 
-    hist_messages = get_session_history(session_id)
-    v = []
-    for step in agent.stream(
-        {
-            "messages" : [{"role" : "user", "content" : query}],
-            "session_id": str(session_id)
-        },
-        {"configurable": {"thread_id": str(session_id)}},
-        stream_mode = "values",
-    ):
-        v.append(step["messages"][-1].pretty_repr())
+    with tracer.start_as_current_span("rag.query") as span:
+        span.set_attribute("session.id", str(session_id))
+        span.set_attribute("input.value", query)
 
-    full_conv = hist_messages + v 
-    save_thread_history(session_id, full_conv)
+        hist_messages = get_session_history(session_id)
+        v = []
+        for step in agent.stream(
+            {
+                "messages" : [{"role" : "user", "content" : query}],
+                "session_id": str(session_id)
+            },
+            {"configurable": {"thread_id": str(session_id)}},
+            stream_mode = "values",
+        ):
+            v.append(step["messages"][-1].pretty_repr())
 
-    response = v[-1]
-    response = response.replace("================================== Ai Message ==================================\n\n", "")
+        full_conv = hist_messages + v
+        save_thread_history(session_id, full_conv)
+
+        response = v[-1]
+        response = response.replace("================================== Ai Message ==================================\n\n", "")
+
+        span.set_attribute("output.value", response)
 
     if get_session_hist:
         return response, full_conv

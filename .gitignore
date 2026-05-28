@@ -15,3 +15,7 @@ uv.lock
 
 # Editor
 .DS_Store
+
+test_new_rag.py
+rag_old.py
+env.yml
